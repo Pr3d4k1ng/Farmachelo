@@ -3,16 +3,6 @@ import axios from 'axios';
 
 const API = process.env.REACT_APP_BACKEND_URL ? `${process.env.REACT_APP_BACKEND_URL}/api` : 'http://localhost:8000/api';
 
-const formatPrice = (price) => {
-  const numericPrice = typeof price === 'number' ? price : parseFloat(price) || 0;
-  return new Intl.NumberFormat('es-CO', {
-    style: 'currency',
-    currency: 'COP',
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  }).format(numericPrice);
-};
-
 const CartModal = ({ isOpen, onClose, cart, onUpdateCart, token }) => {
   const updateQuantity = async (productId, newQuantity) => {
     if (newQuantity <= 0) {
@@ -46,7 +36,7 @@ const CartModal = ({ isOpen, onClose, cart, onUpdateCart, token }) => {
     if (!cart || !cart.items) return 0;
     return cart.items.reduce((total, item) => total + (item.price * item.quantity), 0);
   };
-  
+
   if (!isOpen) return null;
 
   return (
@@ -80,7 +70,7 @@ const CartModal = ({ isOpen, onClose, cart, onUpdateCart, token }) => {
                     
                     <div className="item-details">
                       <h4>{item.name || 'Producto'}</h4>
-                      <p className="item-price">{formatPrice(item.price || 0)}</p>
+                      <p className="item-price">$ {(item.price || 0).toLocaleString('es-CO')}</p>
                       {item.requires_prescription && (
                         <span className="prescription-note">💊 Requiere receta</span>
                       )}
@@ -115,7 +105,7 @@ const CartModal = ({ isOpen, onClose, cart, onUpdateCart, token }) => {
               
               <div className="cart-summary">
                 <div className="total-section">
-                  <h3>Total: {formatPrice(getTotalPrice())}</h3>
+                  <h3>Total: $ {getTotalPrice().toLocaleString('es-CO')}</h3>
                 </div>
                 
                 <div className="cart-actions">
@@ -126,10 +116,17 @@ const CartModal = ({ isOpen, onClose, cart, onUpdateCart, token }) => {
                     className="checkout-btn"
                     onClick={() => {
                       onClose();
-                      // Guardar el carrito actual en localStorage con el total
+                      // Guardar el carrito actual en localStorage con estructura mejorada
                       const cartData = {
-                        items: cart.items,
-                        total: getTotalPrice() // Asegúrate de que getTotalPrice() devuelve el total
+                        items: cart.items.map(item => ({
+                          product_id: item.product_id || item.id,
+                          id: item.product_id || item.id,
+                          name: item.name,
+                          price: item.price,
+                          quantity: item.quantity,
+                          image_url: item.image_url
+                        })),
+                        total: getTotalPrice()
                       };
                       localStorage.setItem('cart', JSON.stringify(cartData));
                       window.location.href = "/payment.html";

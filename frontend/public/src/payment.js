@@ -1,8 +1,6 @@
 function formatPrice(price) {
   const numericPrice = typeof price === 'number' ? price : parseFloat(price) || 0;
   return new Intl.NumberFormat('es-CO', {
-    style: 'currency',
-    currency: 'COP',
     minimumFractionDigits: 0,
     maximumFractionDigits: 0
   }).format(numericPrice);
@@ -36,6 +34,78 @@ class FormHandler {
     const createAccount = document.getElementById("createAccount")
     if (forgotPassword) forgotPassword.addEventListener("click", this.handleForgotPassword.bind(this))
     if (createAccount) createAccount.addEventListener("click", this.handleCreateAccount.bind(this))
+  }
+
+  generateInvoiceData(paymentData, paymentResponse) {
+    const items = this.orderManager.items || [];
+    const subtotal = this.orderManager.total;
+    const taxRate = 0.19; // 19% IVA Colombia
+    const taxAmount = Math.round(subtotal * taxRate);
+    const totalAmount = subtotal + taxAmount;
+
+    const invoiceNumber = paymentResponse.invoiceNumber || `FAC-${Date.now()}`;
+
+    return {
+      invoice: {
+        id: paymentResponse.invoiceId || `inv_${Date.now()}`,
+        invoice_number: invoiceNumber,
+        issue_date: new Date().toISOString(),
+        status: "paid",
+        payment_method: paymentResponse.paymentMethod,
+        subtotal: subtotal,
+        tax_amount: taxAmount,
+        discount_amount: 0,
+        total_amount: totalAmount,
+        customer_info: {
+          name: paymentData.cardholderName || 'Cliente',
+          email: paymentData.email,
+          phone: '', // Podrías agregar campo teléfono en el formulario
+          address: paymentData.country
+        },
+        items: items.map(item => ({
+          id: item.id || `prod_${Math.random().toString(36).substr(2, 9)}`,
+          name: item.name,
+          quantity: Number(item.quantity) || 1,
+          unit_price: Number(item.price) || 0,
+          total_price: (Number(item.price) || 0) * (Number(item.quantity) || 1),
+          requires_prescription: !!item.requires_prescription
+        })),
+        transaction_id: paymentResponse.transactionId
+      },
+      customer: {
+        name: paymentData.cardholderName || 'Cliente',
+        email: paymentData.email
+      },
+      metadata: {
+        generated_at: new Date().toISOString(),
+        source: 'payment_page'
+      }
+    };
+  }
+
+  saveInvoiceData(invoiceData) {
+    try {
+      // 1. localStorage (para invoice.html)
+      localStorage.setItem('last_invoice_data', JSON.stringify(invoiceData));
+
+      // 2. sessionStorage (backup)
+      sessionStorage.setItem('current_invoice', JSON.stringify(invoiceData));
+
+      // 3. URL parameters (máxima redundancia)
+      const urlParams = new URLSearchParams({
+        invoice: invoiceData.invoice.invoice_number,
+        status: 'success'
+      });
+
+      // 4. Guardar también en el objeto window para acceso inmediato
+      window.lastInvoiceData = invoiceData;
+
+      console.log('✅ Datos de factura guardados en múltiples ubicaciones');
+      console.log('📦 Items en la factura:', invoiceData.invoice.items.length);
+
+    } catch (error) {
+      console.error('❌ Error guardando datos de factura:', error);
+    }
   }
 
   setupCardFormatting() {
@@ -134,31 +204,62 @@ class FormHandler {
     const formData = new FormData(paymentForm);
     const paymentData = {
       email: formData.get("email"),
-      cardNumber: formData.get("cardNumber")?.replace(/\s/g, ""),
-      expiryDate: formData.get("expiryDate")?.replace(/\s/g, ""),
-      cvv: formData.get("cvv"),
-      cardholderName: formData.get("cardholderName"),
-      country: formData.get("country"),
+      card: {
+        cardNumber: formData.get("cardNumber")?.replace(/\s/g, ""),
+        expiryDate: formData.get("expiryDate")?.replace(/\s/g, ""),
+        cvv: formData.get("cvv"),
+        cardholderName: formData.get("cardholderName"),
+        country: formData.get("country")
+      },
       amount: this.orderManager.total,
-      currency: "COP",
+      currency: "COP"
     };
 
     try {
-      this.setLoadingState(payButton, true)
-      const response = await this.processPayment(paymentData)
-      if (response.success) {
-        this.showSuccessMessage("¡Pago procesado exitosamente!")
+      this.setLoadingState(payButton, true);
+
+      // Llamar al backend para procesar el pago
+      const response = await fetch(`${API_CONFIG.baseURL}${API_CONFIG.endpoints.payment}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.getAuthToken()}`
+        },
+        body: JSON.stringify(paymentData)
+      });
+
+      const result = await response.json();
+
+      if (response.ok && result.success) {
+        this.showSuccessMessage("¡Pago procesado exitosamente!");
+
+        console.log('✅ Pago exitoso, generando factura...');
+        console.log('📦 Items en carrito:', this.orderManager?.items);
+        console.log('💰 Total:', this.orderManager?.total);
+        console.log('🔢 Número de factura backend:', result.invoiceNumber);
+
+        // GENERAR DATOS COMPLETOS DE FACTURA USANDO DATOS DEL BACKEND
+        const invoiceData = this.generateInvoiceData(paymentData, result);
+        console.log('📄 Datos de factura generados:', invoiceData);
+
+        // Guardar en múltiples lugares para redundancia
+        this.saveInvoiceData(invoiceData);
+
+        console.log('🔗 Redirigiendo a invoice.html en 1.5 segundos...');
+
+        // Redirigir a factura
         setTimeout(() => {
-          window.location.href = "/success"
-        }, 2000)
+          console.log('🔄 Redirigiendo ahora a invoice.html');
+          window.location.href = 'invoice.html';
+        }, 1500);
       } else {
-        this.showErrorMessage(response.error || "Error al procesar el pago")
+        throw new Error(result.error || "Error al procesar el pago");
       }
     } catch (error) {
-      console.error("Payment error:", error)
-      this.showErrorMessage("Error de conexión. Por favor, intenta nuevamente.")
+      console.error("Payment error:", error);
+      this.showErrorMessage(error.message || "Error de conexión. Por favor, intenta nuevamente.");
     } finally {
-      this.setLoadingState(payButton, false)
+      this.setLoadingState(payButton, false);
     }
   }
 
@@ -275,11 +376,11 @@ class FormHandler {
   }
 
   getAuthToken() {
-    return localStorage.getItem("farmachelo_auth_token")
+    return localStorage.getItem("token")
   }
 
   setAuthToken(token) {
-    localStorage.setItem("farmachelo_auth_token", token)
+    localStorage.setItem("token", token)
   }
 }
 
@@ -290,51 +391,45 @@ class OrderManager {
     this.loadOrderData();
   }
 
-async loadOrderData() {
-  try {
-    // Cargar carrito desde localStorage
-    const cartRaw = localStorage.getItem('cart');
-    let cart = null;
-    
-    if (cartRaw) {
-      try {
-        cart = JSON.parse(cartRaw);
-        // Asegurarse de que la estructura sea consistente
-        if (cart && cart.items && Array.isArray(cart.items)) {
-          this.items = cart.items.map(item => ({
-            id: item.product_id || item.id, // Asegurar compatibilidad
-            name: item.name || 'Producto',
-            quantity: item.quantity || 1,
-            price: item.price || 0
-          }));
-          
-          // Usar el total guardado si está disponible
-          if (cart.total) {
-            this.updateTotalDisplay(cart.total);
-          } else {
-            this.calculateTotal();
-          }
-          
-          this.updateOrderDisplay();
-          return;
+  async loadOrderData() {
+    try {
+      const cartRaw = localStorage.getItem('cart');
+      let cartData = null;
+
+      if (cartRaw) {
+        try {
+          cartData = JSON.parse(cartRaw);
+        } catch (e) {
+          console.error("Error parsing cart:", e);
+          cartData = null;
         }
-      } catch (e) { 
-        console.error("Error parsing cart:", e);
       }
+
+      if (cartData && Array.isArray(cartData.items)) {
+        this.items = cartData.items.map(item => ({
+          id: item.id,
+          name: item.name || 'Producto',
+          quantity: Number(item.quantity) || 1,
+          price: Number(item.price) || 0
+        }));
+
+        // Usar el total calculado desde los items
+        this.calculateTotal();
+        this.updateOrderDisplay();
+      } else {
+        this.items = [];
+        this.total = 0;
+        this.updateTotalDisplay(0);
+        this.updateOrderDisplay();
+      }
+    } catch (error) {
+      console.error("Error loading order data:", error);
+      this.items = [];
+      this.total = 0;
+      this.updateTotalDisplay(0);
     }
-    
-    // Si no hay carrito válido, mostrar vacío
-    this.items = [];
-    this.calculateTotal();
-    this.updateOrderDisplay();
-    
-  } catch (error) {
-    console.error("Error loading order data:", error);
-    this.items = [];
-    this.calculateTotal();
-    this.updateOrderDisplay();
   }
-}
+
   calculateTotal() {
     this.total = this.items.reduce((acc, item) => acc + (item.price * item.quantity), 0);
     this.updateTotalDisplay(this.total);
@@ -343,9 +438,10 @@ async loadOrderData() {
   updateTotalDisplay(total) {
     const totalAmount = document.getElementById("totalAmount");
     const payButtonAmount = document.getElementById("payButtonAmount");
-    
-    if (totalAmount) totalAmount.textContent = formatPrice(total);
-    if (payButtonAmount) payButtonAmount.textContent = formatPrice(total);
+    const formattedTotal = formatPrice(total);
+
+    if (totalAmount) totalAmount.textContent = `$${formattedTotal}`;
+    if (payButtonAmount) payButtonAmount.textContent = formattedTotal;
   }
 
   addItem(item) {
@@ -380,8 +476,11 @@ async loadOrderData() {
 
 // Inicialización
 document.addEventListener("DOMContentLoaded", () => {
-  const orderManager = new OrderManager()
-  const formHandler = new FormHandler(orderManager)
+  const orderManager = new OrderManager();
+
+  // Crear formHandler y asignarle el orderManager
+  const formHandler = new FormHandler();
+  formHandler.orderManager = orderManager; // Asignar el orderManager al formHandler
 
   // Handler para el botón "Proceder al pago"
   const payBtn = document.getElementById("payButton")
@@ -400,6 +499,8 @@ document.addEventListener("DOMContentLoaded", () => {
     })
   }
 })
+
+// Depuración opcional del carrito eliminada para evitar errores de variables no definidas
 
 // Export para uso en módulos (opcional)
 if (typeof module !== "undefined" && module.exports) {

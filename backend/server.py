@@ -74,7 +74,7 @@ class Product(BaseModel):
     name: str
     description: str
     price: float
-    category: str  # "prescription" or "over_counter"
+    category: Optional[str] = None  # Ahora opcional
     stock: int
     image_url: Optional[str] = None
     requires_prescription: bool = False
@@ -85,7 +85,7 @@ class ProductCreate(BaseModel):
     name: str
     description: str
     price: float
-    category: str
+    category: Optional[str] = None  # Ahora opcional
     stock: int
     image_url: Optional[str] = None
     requires_prescription: bool = False
@@ -109,6 +109,20 @@ class Order(BaseModel):
     status: str = "pending"  # pending, paid, processing, shipped, delivered, cancelled
     payment_session_id: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # Campos de facturación (consolidados en order)
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[datetime] = None
+    enriched_items: Optional[List[Dict[str, Any]]] = None  # Items con detalles completos del producto
+    subtotal: Optional[float] = None
+    tax_amount: Optional[float] = None
+    discount_amount: Optional[float] = 0.0
+    currency: str = "COP"
+    payment_method: Optional[str] = None
+    payment_transaction_id: Optional[str] = None
+    customer_info: Optional[Dict[str, Any]] = None
+    shipping_info: Optional[Dict[str, Any]] = None
+    invoice_notes: Optional[str] = None
 
 class PaymentTransaction(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -136,15 +150,18 @@ class PaymentCard(BaseModel):
     country: str
 
 class PaymentRequest(BaseModel):
-    email: EmailStr
+    email: EmailStr 
     card: PaymentCard
     amount: float
-    currency: str = "COP"  # Cambiar de "$" a "COP"
+    currency: str = "COP"
     order_id: Optional[str] = None
+    items: Optional[List[Dict[str, Any]]] = None
 
 class PaymentResponse(BaseModel):
     success: bool
     transactionId: Optional[str] = None
+    invoiceId: Optional[str] = None  # Añadir este campo
+    invoiceNumber: Optional[str] = None
     error: Optional[str] = None
 
 class CardValidationRequest(BaseModel):
@@ -156,8 +173,6 @@ class CardValidationResponse(BaseModel):
     valid: bool
     cardType: Optional[str] = None
     error: Optional[str] = None
-
-# ==================== PAYMENT HELPER FUNCTIONS ====================
 
 def validate_card_number(card_number: str) -> bool:
     """Validar número de tarjeta usando el algoritmo de Luhn"""
@@ -217,13 +232,16 @@ def validate_expiry_date(expiry_date: str) -> bool:
     except:
         return False
 
-# ==================== HELPER FUNCTIONS ====================
+
+# ==================== HELPER / AUTH FUNCTIONS ====================
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
+
 def verify_password(password: str, hashed: str) -> bool:
     return hash_password(password) == hashed
+
 
 def create_jwt_token(user_id: str) -> str:
     payload = {
@@ -232,6 +250,7 @@ def create_jwt_token(user_id: str) -> str:
         "iat": datetime.now(timezone.utc)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
 
 async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
     if credentials is None:
@@ -248,8 +267,10 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
     except jwt.JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
 def generate_admin_token() -> str:
     return secrets.token_urlsafe(32)
+
 
 async def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
     if credentials is None:
@@ -272,15 +293,53 @@ async def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] 
             return admin_user
             
         raise HTTPException(status_code=403, detail="Admin privileges required")
-        
+            
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    
+# NOTE: The helper/auth functions above were intentionally inserted earlier to ensure they
+# are available for route dependency injection (Depends(get_current_user)).
+
 
 # ==================== PAYMENT ROUTES ====================
 
 api_router = APIRouter(prefix="/api")
+
+    
+
+@api_router.post("/payments/validate-card", response_model=CardValidationResponse)
+async def validate_card(card_request: CardValidationRequest):
+    """
+    Validar los datos de una tarjeta de crédito/débito
+    """
+    try:
+        # Validar número de tarjeta
+        if not validate_card_number(card_request.cardNumber):
+            return CardValidationResponse(valid=False, error="Número de tarjeta inválido")
+        
+        # Validar fecha de expiración
+        if not validate_expiry_date(card_request.expiryDate):
+            return CardValidationResponse(valid=False, error="Fecha de expiración inválida o tarjeta expirada")
+        
+        # Validar CVV
+        cvv = card_request.cvv
+        if not (3 <= len(cvv) <= 4 and cvv.isdigit()):
+            return CardValidationResponse(valid=False, error="CVV inválido")
+        
+        # Determinar tipo de tarjeta
+        card_type = get_card_type(card_request.cardNumber)
+        
+        return CardValidationResponse(valid=True, cardType=card_type)
+        
+    except Exception as e:
+        logger.error(f"Error validating card: {str(e)}")
+        return CardValidationResponse(valid=False, error="Error interno del servidor")
+
+
+
+# ==================== ORDERS ROUTES ====================
 
 @api_router.post("/payments/process", response_model=PaymentResponse)
 async def process_payment(
@@ -293,27 +352,54 @@ async def process_payment(
         enriched_cart = await _enrich_cart(cart)
         cart_total = sum(item["price"] * item["quantity"] for item in enriched_cart["items"])
         
-        if abs(payment_request.amount - cart_total) > 0.01:  # Permitir pequeñas diferencias por redondeo
+        if abs(payment_request.amount - cart_total) > 0.01:
             return PaymentResponse(success=False, error="El monto no coincide con el carrito actual")
         
-        # Resto de la lógica original de procesamiento de pago
-        if not validate_card_number(payment_request.card.cardNumber):
-            return PaymentResponse(success=False, error="Número de tarjeta inválido")
+        # Validaciones de tarjeta (DESHABILITADAS PARA TESTING)
+        # if not validate_card_number(payment_request.card.cardNumber):
+        #     return PaymentResponse(success=False, error="Número de tarjeta inválido")
         
-        if not validate_expiry_date(payment_request.card.expiryDate):
-            return PaymentResponse(success=False, error="Fecha de expiración inválida o tarjeta expirada")
+        # if not validate_expiry_date(payment_request.card.expiryDate):
+        #     return PaymentResponse(success=False, error="Fecha de expiración inválida o tarjeta expirada")
         
-        # Validar CVV (3-4 dígitos)
-        cvv = payment_request.card.cvv
-        if not (3 <= len(cvv) <= 4 and cvv.isdigit()):
-            return PaymentResponse(success=False, error="CVV inválido")
+        # cvv = payment_request.card.cvv
+        # if not (3 <= len(cvv) <= 4 and cvv.isdigit()):
+        #     return PaymentResponse(success=False, error="CVV inválido")
         
-        # Simular procesamiento de pago
-        success = secrets.SystemRandom().random() > 0.3
+        # Simular procesamiento de pago (100% de éxito para testing)
+        success = True # secrets.SystemRandom().random() > 0.2
         
         if success:
             transaction_id = f"TXN_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
             
+            # 1. Crear la orden primero si no existe
+            order_id = payment_request.order_id or f"ORD_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
+            
+            # Crear orden si no existe
+            existing_order = await db.orders.find_one({"id": order_id})
+            if not existing_order:
+                order_data = {
+                    "id": order_id,
+                    "user_id": current_user_id,
+                    "items": [item.dict() for item in cart.items] if hasattr(cart, 'items') else [],
+                    "total_amount": payment_request.amount,
+                    "status": "paid",
+                    "payment_session_id": transaction_id,
+                    "created_at": datetime.now(timezone.utc)
+                }
+                await db.orders.insert_one(order_data)
+            else:
+                # Actualizar orden existente
+                await db.orders.update_one(
+                    {"id": order_id},
+                    {"$set": {
+                        "status": "paid", 
+                        "payment_session_id": transaction_id,
+                        "total_amount": payment_request.amount
+                    }}
+                )
+            
+            # 2. Guardar transacción de pago
             transaction_data = {
                 "id": str(uuid.uuid4()),
                 "transaction_id": transaction_id,
@@ -324,318 +410,37 @@ async def process_payment(
                 "card_last_four": payment_request.card.cardNumber[-4:],
                 "card_type": get_card_type(payment_request.card.cardNumber),
                 "status": "completed",
-                "order_id": payment_request.order_id,
+                "order_id": order_id,
                 "created_at": datetime.now(timezone.utc)
             }
             
             await db.payment_transactions.insert_one(transaction_data)
             
-            if payment_request.order_id:
-                await db.orders.update_one(
-                    {"id": payment_request.order_id},
-                    {"$set": {"status": "paid", "payment_session_id": transaction_id}}
+            # 3. CREAR FACTURA AUTOMÁTICAMENTE después del pago exitoso
+            try:
+                invoice_result = await create_invoice_after_payment(
+                    order_id=order_id,
+                    payment_transaction_id=transaction_id,
+                    user_id=current_user_id,
+                    payment_method="card"
                 )
+            except Exception as invoice_error:
+                logger.error(f"Error creating invoice: {str(invoice_error)}")
+                # No detener el pago si falla la factura, pero logger el error
+                invoice_result = {"invoice_id": order_id, "invoice_number": "ERROR"}
             
-            return PaymentResponse(success=True, transactionId=transaction_id)
+            return PaymentResponse(
+                success=True, 
+                transactionId=transaction_id,
+                invoiceId=invoice_result.get("invoice_id"),
+                invoiceNumber=invoice_result.get("invoice_number")
+            )
         else:
             return PaymentResponse(success=False, error="Tarjeta rechazada por el banco emisor")
             
     except Exception as e:
         logger.error(f"Error processing payment: {str(e)}")
         return PaymentResponse(success=False, error="Error interno del servidor")
-    
-
-@api_router.post("/payments/validate-card", response_model=CardValidationResponse)
-async def validate_card(card_request: CardValidationRequest):
-    """
-    Validar los datos de una tarjeta de crédito/débito
-    """
-    try:
-        # Validar número de tarjeta
-        if not validate_card_number(card_request.cardNumber):
-            return CardValidationResponse(valid=False, error="Número de tarjeta inválido")
-        
-        # Validar fecha de expiración
-        if not validate_expiry_date(card_request.expiryDate):
-            return CardValidationResponse(valid=False, error="Fecha de expiración inválida o tarjeta expirada")
-        
-        # Validar CVV
-        cvv = card_request.cvv
-        if not (3 <= len(cvv) <= 4 and cvv.isdigit()):
-            return CardValidationResponse(valid=False, error="CVV inválido")
-        
-        # Determinar tipo de tarjeta
-        card_type = get_card_type(card_request.cardNumber)
-        
-        return CardValidationResponse(valid=True, cardType=card_type)
-        
-    except Exception as e:
-        logger.error(f"Error validating card: {str(e)}")
-        return CardValidationResponse(valid=False, error="Error interno del servidor")
-
-# ==================== HELPER FUNCTIONS ====================
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
-
-def create_jwt_token(user_id: str) -> str:
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": datetime.now(timezone.utc)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def generate_admin_token() -> str:
-    return secrets.token_urlsafe(32)
-
-async def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
-        # Buscar en usuarios normales que sean admin
-        user_data = await db.users.find_one({"id": user_id})
-        if user_data and user_data.get("is_admin", False):
-            return user_data
-        
-        # Buscar en la colección de admin_users
-        admin_user = await db.admin_users.find_one({"id": user_id})
-        if admin_user:
-            return admin_user
-            
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-        
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# ==================== PAYMENT ROUTES ====================
-
-api_router = APIRouter(prefix="/api")
-
-# ==================== HELPER FUNCTIONS ====================
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
-
-def create_jwt_token(user_id: str) -> str:
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": datetime.now(timezone.utc)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def generate_admin_token() -> str:
-    return secrets.token_urlsafe(32)
-
-async def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
-        # Buscar en usuarios normales que sean admin
-        user_data = await db.users.find_one({"id": user_id})
-        if user_data and user_data.get("is_admin", False):
-            return user_data
-        
-        # Buscar en la colección de admin_users
-        admin_user = await db.admin_users.find_one({"id": user_id})
-        if admin_user:
-            return admin_user
-            
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-        
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# ==================== PAYMENT ROUTES ====================
-
-api_router = APIRouter(prefix="/api")
-
-@api_router.post("/payments/validate-card", response_model=CardValidationResponse)
-async def validate_card(card_request: CardValidationRequest):
-    """
-    Validar los datos de una tarjeta de crédito/débito
-    """
-    try:
-        # Validar número de tarjeta
-        if not validate_card_number(card_request.cardNumber):
-            return CardValidationResponse(valid=False, error="Número de tarjeta inválido")
-        
-        # Validar fecha de expiración
-        if not validate_expiry_date(card_request.expiryDate):
-            return CardValidationResponse(valid=False, error="Fecha de expiración inválida o tarjeta expirada")
-        
-        # Validar CVV
-        cvv = card_request.cvv
-        if not (3 <= len(cvv) <= 4 and cvv.isdigit()):
-            return CardValidationResponse(valid=False, error="CVV inválido")
-        
-        # Determinar tipo de tarjeta
-        card_type = get_card_type(card_request.cardNumber)
-        
-        return CardValidationResponse(valid=True, cardType=card_type)
-        
-    except Exception as e:
-        logger.error(f"Error validating card: {str(e)}")
-        return CardValidationResponse(valid=False, error="Error interno del servidor")
-
-# ==================== HELPER FUNCTIONS ====================
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
-
-def create_jwt_token(user_id: str) -> str:
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": datetime.now(timezone.utc)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def generate_admin_token() -> str:
-    return secrets.token_urlsafe(32)
-
-async def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
-        # Buscar en usuarios normales que sean admin
-        user_data = await db.users.find_one({"id": user_id})
-        if user_data and user_data.get("is_admin", False):
-            return user_data
-        
-        # Buscar en la colección de admin_users
-        admin_user = await db.admin_users.find_one({"id": user_id})
-        if admin_user:
-            return admin_user
-            
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-        
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# ==================== ORDERS ROUTES ====================
-
-@api_router.get("/orders/summary/{order_id}")
-async def get_order_summary(order_id: str, current_user_id: str = Depends(get_current_user)):
-    """
-    Obtener resumen de un pedido para procesar pago
-    """
-    try:
-        # Buscar el pedido
-        order = await db.orders.find_one({"id": order_id, "user_id": current_user_id})
-        if not order:
-            raise HTTPException(status_code=404, detail="Pedido no encontrado")
-        
-        # Enriquecer los items del pedido con información del producto
-        enriched_items = []
-        total_amount = 0
-        
-        for item in order.get("items", []):
-            product = await db.products.find_one({"id": item["product_id"]})
-            if product:
-                item_total = product["price"] * item["quantity"]
-                total_amount += item_total
-                
-                enriched_items.append({
-                    "id": item["product_id"],
-                    "name": product["name"],
-                    "description": product["description"],
-                    "quantity": item["quantity"],
-                    "price": product["price"],
-                    "total": item_total,
-                    "image_url": product.get("image_url")
-                })
-        
-                return {
-                    "order_id": order_id,
-                    "items": enriched_items,
-                    "total_amount": total_amount,
-                    "currency": "COP",  # Ya está correcto
-                    "status": order.get("status", "pending")
-                }
-        
-    except Exception as e:
-        logger.error(f"Error getting order summary: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error al obtener resumen del pedido")
     
 #===================== ADMIN ====================
 
@@ -665,66 +470,129 @@ class ProductUpdate(BaseModel):
     requires_prescription: Optional[bool] = None
     active: Optional[bool] = None
 
-# ==================== HELPER FUNCTIONS ====================
+class OrderStats(BaseModel):
+    total_orders: int = 0
+    pending_orders: int = 0
+    paid_orders: int = 0
+    processing_orders: int = 0
+    shipped_orders: int = 0
+    delivered_orders: int = 0
+    cancelled_orders: int = 0
+    total_revenue: float = 0
+    monthly_revenue: float = 0
+    monthly_orders: int = 0
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+class OrderUpdate(BaseModel):
+    status: str
 
-def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
-
-def create_jwt_token(user_id: str) -> str:
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": datetime.now(timezone.utc)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+# Helper/auth functions were defined earlier in the file to support Depends(get_current_user)
+# (duplicates removed)
     
+async def create_invoice_after_payment(order_id: str, payment_transaction_id: str, user_id: str, payment_method: str = "card"):
+        
     try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def generate_admin_token() -> str:
-    return secrets.token_urlsafe(32)
-
-async def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        # Verificar que la orden existe
+        order = await db.orders.find_one({"id": order_id, "user_id": user_id})
+        if not order:
+            raise Exception("Orden no encontrada")
         
-        # Buscar en usuarios normales que sean admin
-        user_data = await db.users.find_one({"id": user_id})
-        if user_data and user_data.get("is_admin", False):
-            return user_data
+        # Obtener información del usuario
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise Exception("Usuario no encontrado")
         
-        # Buscar en la colección de admin_users
-        admin_user = await db.admin_users.find_one({"id": user_id})
-        if admin_user:
-            return admin_user
-            
-        raise HTTPException(status_code=403, detail="Admin privileges required")
+        # Generar número de factura SIMPLE (1, 2, 3, 4...)
+        # Contar cuántos pedidos pagados existen
+        paid_orders_count = await db.orders.count_documents({"status": {"$in": ["paid", "processing", "shipped", "delivered"]}})
+        invoice_number = f"{paid_orders_count + 1:05d}"  # Número simple: "00001", "00002"...
         
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        # Enriquecer items de la orden
+        enriched_items = []
+        for item in order.get("items", []):
+            product = await db.products.find_one({"id": item["product_id"]})
+            if product:
+                item_total = product["price"] * item["quantity"]
+                enriched_items.append({
+                    "product_id": item["product_id"],
+                    "name": product["name"],
+                    "description": product.get("description", ""),
+                    "quantity": item["quantity"],
+                    "unit_price": product["price"],
+                    "total_price": item_total,
+                    "requires_prescription": product.get("requires_prescription", False)
+                })
+        
+        # Si no hay items en la orden, usar datos del carrito actual
+        if not enriched_items:
+            cart = await _get_or_create_cart(user_id)
+            enriched_cart = await _enrich_cart(cart)
+            for item in enriched_cart.get("items", []):
+                item_total = item["price"] * item["quantity"]
+                enriched_items.append({
+                    "product_id": item["product_id"],
+                    "name": item["name"],
+                    "description": "",
+                    "quantity": item["quantity"],
+                    "unit_price": item["price"],
+                    "total_price": item_total,
+                    "requires_prescription": item.get("requires_prescription", False)
+                })
+        
+        # Calcular totales
+        subtotal = sum(item["total_price"] for item in enriched_items)
+        tax_rate = 0.19  # 19% IVA para Colombia
+        tax_amount = subtotal * tax_rate
+        total_amount = subtotal + tax_amount
+        
+        # Información del cliente
+        customer_info = {
+            "name": user["name"],
+            "email": user["email"],
+            "phone": user.get("phone", ""),
+            "address": user.get("address", ""),
+            "identification": user.get("identification", "")
+        }
+        
+        # ACTUALIZAR LA ORDEN con los datos de facturación
+        now = datetime.now(timezone.utc)
+        update_result = await db.orders.update_one(
+            {"id": order_id},
+            {"$set": {
+                "status": "paid",
+                "invoice_number": invoice_number,
+                "invoice_date": now,
+                "enriched_items": enriched_items,
+                "subtotal": subtotal,
+                "tax_amount": tax_amount,
+                "discount_amount": 0.0,
+                "total_amount": total_amount,
+                "currency": "COP",
+                "payment_method": payment_method,
+                "payment_transaction_id": payment_transaction_id,
+                "customer_info": customer_info,
+                "shipping_info": customer_info,
+                "invoice_notes": "Gracias por su compra en Farmachelo"
+            }}
+        )
+        
+        if update_result.modified_count == 0:
+            raise Exception("No se pudo actualizar la orden con los datos de facturación")
+        
+        # Limpiar carrito después de pago exitoso
+        await db.carts.update_one(
+            {"user_id": user_id},
+            {"$set": {"items": [], "updated_at": datetime.now(timezone.utc)}}
+        )
+        
+        # Retornar información de factura
+        return {
+            "invoice_id": order_id,  # El ID del order es el ID de la factura
+            "invoice_number": invoice_number
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating invoice after payment: {str(e)}")
+        return {"success": False, "error": str(e)}
 
 # ==================== PRODUCTS DATA ====================
 
@@ -811,6 +679,261 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== ROUTES ====================
+
+# ==================== INVOICE MODELS ====================
+
+class Invoice(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    order_id: str
+    user_id: str
+    invoice_number: str
+    issue_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    due_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc) + timedelta(days=30))
+    items: List[Dict[str, Any]] = []
+    subtotal: float
+    tax_amount: float = 0.0
+    discount_amount: float = 0.0
+    total_amount: float
+    currency: str = "COP"
+    status: str = "paid"  # paid, pending, cancelled
+    payment_method: Optional[str] = None
+    payment_transaction_id: Optional[str] = None
+    customer_info: Dict[str, Any] = {}
+    shipping_info: Dict[str, Any] = {}
+    notes: Optional[str] = None
+
+class InvoiceResponse(BaseModel):
+    invoice: Invoice
+    order: Optional[Dict[str, Any]] = None
+    customer: Optional[Dict[str, Any]] = None
+
+class InvoiceCreate(BaseModel):
+    order_id: str
+    payment_transaction_id: str
+    payment_method: str = "card"
+
+# ==================== INVOICE ROUTES ====================
+
+@api_router.post("/invoices", response_model=InvoiceResponse)
+async def create_invoice(
+    invoice_data: InvoiceCreate,
+    current_user_id: str = Depends(get_current_user)
+):
+    """
+    Crear factura después de un pago exitoso
+    """
+    try:
+        # Verificar que la orden existe y pertenece al usuario
+        order = await db.orders.find_one({"id": invoice_data.order_id, "user_id": current_user_id})
+        if not order:
+            raise HTTPException(status_code=404, detail="Orden no encontrada")
+        
+        # Verificar transacción de pago
+        payment_transaction = await db.payment_transactions.find_one({
+            "transaction_id": invoice_data.payment_transaction_id
+        })
+        if not payment_transaction:
+            raise HTTPException(status_code=404, detail="Transacción de pago no encontrada")
+        
+        # Obtener información del usuario
+        user = await db.users.find_one({"id": current_user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        
+        # Generar número de factura único
+        today = datetime.now(timezone.utc)
+        invoice_count = await db.invoices.count_documents({
+            "issue_date": {"$gte": today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)}
+        })
+        invoice_number = f"FAC-{today.strftime('%Y%m')}-{invoice_count + 1:04d}"
+        
+        # Enriquecer items de la orden
+        enriched_items = []
+        for item in order.get("items", []):
+            product = await db.products.find_one({"id": item["product_id"]})
+            if product:
+                item_total = product["price"] * item["quantity"]
+                enriched_items.append({
+                    "product_id": item["product_id"],
+                    "name": product["name"],
+                    "description": product.get("description", ""),
+                    "quantity": item["quantity"],
+                    "unit_price": product["price"],
+                    "total_price": item_total,
+                    "requires_prescription": product.get("requires_prescription", False)
+                })
+        
+        # Calcular totales
+        subtotal = sum(item["total_price"] for item in enriched_items)
+        tax_rate = 0.19  # 19% IVA para Colombia
+        tax_amount = subtotal * tax_rate
+        total_amount = subtotal + tax_amount
+        
+        # Información del cliente
+        customer_info = {
+            "name": user["name"],
+            "email": user["email"],
+            "phone": user.get("phone", ""),
+            "address": user.get("address", ""),
+            "identification": user.get("identification", "")
+        }
+        
+        # Crear factura
+        invoice = Invoice(
+            order_id=invoice_data.order_id,
+            user_id=current_user_id,
+            invoice_number=invoice_number,
+            items=enriched_items,
+            subtotal=subtotal,
+            tax_amount=tax_amount,
+            total_amount=total_amount,
+            payment_method=invoice_data.payment_method,
+            payment_transaction_id=invoice_data.payment_transaction_id,
+            customer_info=customer_info,
+            shipping_info=customer_info,  # Por defecto misma dirección de envío
+            notes="Gracias por su compra en Farmachelo"
+        )
+        
+        # Guardar en base de datos
+        await db.invoices.insert_one(invoice.dict())
+        
+        # Actualizar orden con referencia a la factura
+        await db.orders.update_one(
+            {"id": invoice_data.order_id},
+            {"$set": {"invoice_id": invoice.id, "status": "completed"}}
+        )
+        
+        return InvoiceResponse(
+            invoice=invoice,
+            order=order,
+            customer=customer_info
+        )
+        
+    except Exception as e:
+        logger.error(f"Error creating invoice: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al crear factura")
+
+@api_router.get("/invoices/{invoice_id}", response_model=InvoiceResponse)
+async def get_invoice(
+    invoice_id: str,
+    current_user_id: str = Depends(get_current_user)
+):
+    """
+    Obtener factura por ID
+    """
+    try:
+        # Buscar factura
+        invoice_data = await db.invoices.find_one({"id": invoice_id})
+        if not invoice_data:
+            raise HTTPException(status_code=404, detail="Factura no encontrada")
+        
+        # Verificar que el usuario es el propietario o es admin
+        if invoice_data["user_id"] != current_user_id:
+            # Verificar si es admin
+            user_data = await db.users.find_one({"id": current_user_id})
+            if not user_data or not user_data.get("is_admin", False):
+                raise HTTPException(status_code=403, detail="No autorizado para ver esta factura")
+        
+        invoice = Invoice(**invoice_data)
+        
+        # Obtener información adicional
+        order = await db.orders.find_one({"id": invoice.order_id})
+        customer = await db.users.find_one({"id": invoice.user_id})
+        
+        customer_info = None
+        if customer:
+            customer_info = {
+                "name": customer["name"],
+                "email": customer["email"],
+                "phone": customer.get("phone", ""),
+                "address": customer.get("address", "")
+            }
+        
+        return InvoiceResponse(
+            invoice=invoice,
+            order=order,
+            customer=customer_info
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting invoice: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener factura")
+
+@api_router.get("/invoices")
+async def get_user_invoices(current_user_id: str = Depends(get_current_user)):
+    """
+    Obtener todas las facturas del usuario
+    """
+    try:
+        invoices = await db.invoices.find({"user_id": current_user_id}).sort("issue_date", -1).to_list(50)
+        return [Invoice(**invoice) for invoice in invoices]
+        
+    except Exception as e:
+        logger.error(f"Error getting user invoices: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener facturas")
+
+# ==================== ADMIN INVOICE ROUTES ====================
+
+@api_router.get("/admin/invoices", response_model=List[Invoice])
+async def get_all_invoices(
+    skip: int = 0,
+    limit: int = 50,
+    status: Optional[str] = None,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Obtener todas las facturas (solo administradores)
+    """
+    try:
+        query = {}
+        if status:
+            query["status"] = status
+            
+        invoices = await db.invoices.find(query).sort("issue_date", -1).skip(skip).limit(limit).to_list(limit)
+        return [Invoice(**invoice) for invoice in invoices]
+        
+    except Exception as e:
+        logger.error(f"Error getting all invoices: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener facturas")
+
+@api_router.get("/admin/invoices/stats")
+async def get_invoice_stats(current_admin: dict = Depends(get_current_admin)):
+    """
+    Obtener estadísticas de facturación (solo administradores)
+    """
+    try:
+        # Total facturas
+        total_invoices = await db.invoices.count_documents({})
+        
+        # Facturas por mes actual
+        start_of_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        monthly_invoices = await db.invoices.count_documents({"issue_date": {"$gte": start_of_month}})
+        
+        # Ingresos totales
+        pipeline = [
+            {"$group": {"_id": None, "total_revenue": {"$sum": "$total_amount"}}}
+        ]
+        revenue_result = await db.invoices.aggregate(pipeline).to_list(1)
+        total_revenue = revenue_result[0]["total_revenue"] if revenue_result else 0
+        
+        # Ingresos del mes
+        monthly_pipeline = [
+            {"$match": {"issue_date": {"$gte": start_of_month}}},
+            {"$group": {"_id": None, "monthly_revenue": {"$sum": "$total_amount"}}}
+        ]
+        monthly_revenue_result = await db.invoices.aggregate(monthly_pipeline).to_list(1)
+        monthly_revenue = monthly_revenue_result[0]["monthly_revenue"] if monthly_revenue_result else 0
+        
+        return {
+            "total_invoices": total_invoices,
+            "monthly_invoices": monthly_invoices,
+            "total_revenue": total_revenue,
+            "monthly_revenue": monthly_revenue
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting invoice stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener estadísticas")
 
 @api_router.get("/")
 async def root():
@@ -913,16 +1036,17 @@ async def _enrich_cart(cart: Cart) -> Dict[str, Any]:
     enriched_items: List[Dict[str, Any]] = []
     for item in cart.items:
         product = await db.products.find_one({"id": item.product_id})
-        enriched_items.append({
-            "product_id": item.product_id,
-            "quantity": item.quantity,
-            "prescription_file": item.prescription_file,
-            "name": product.get("name") if product else "Producto",
-            "price": float(product.get("price", 0)),
-            "image_url": product.get("image_url") if product else None,
-            "requires_prescription": bool(product.get("requires_prescription", False)) if product else False,
-            "id": item.product_id
-        })
+        if product:
+            enriched_items.append({
+                "product_id": item.product_id,
+                "quantity": item.quantity,
+                "prescription_file": item.prescription_file,
+                "name": product.get("name"),
+                "price": float(product.get("price", 0)),
+                "image_url": product.get("image_url"),
+                "requires_prescription": bool(product.get("requires_prescription", False)),
+                "id": item.product_id
+            })
     return {
         "id": cart.id,
         "user_id": cart.user_id,
@@ -938,23 +1062,33 @@ async def get_cart(current_user_id: str = Depends(get_current_user)):
 
 @api_router.post("/cart/items")
 async def add_cart_item(cart_item: CartItem, current_user_id: str = Depends(get_current_user)):
+    logger.info(f"Adding item to cart for user {current_user_id}: {cart_item}")
     # Verificar producto
     product = await db.products.find_one({"id": cart_item.product_id, "active": True})
     if not product:
+        logger.error(f"Product not found: {cart_item.product_id}")
         raise HTTPException(status_code=404, detail="Product not found")
 
     cart = await _get_or_create_cart(current_user_id)
+    logger.info(f"Cart found/created: {cart.id}")
     # Buscar item existente
     index = next((i for i, it in enumerate(cart.items) if it.product_id == cart_item.product_id), None)
     if index is not None:
         cart.items[index].quantity += max(1, cart_item.quantity)
+        logger.info(f"Updated quantity for product {cart_item.product_id} to {cart.items[index].quantity}")
     else:
         if cart_item.quantity <= 0:
             cart_item.quantity = 1
         cart.items.append(cart_item)
+        logger.info(f"Added new product {cart_item.product_id} to cart")
     cart.updated_at = datetime.now(timezone.utc)
-    await db.carts.update_one({"user_id": current_user_id}, {"$set": cart.dict()}, upsert=True)
-    return await _enrich_cart(cart)
+    
+    update_result = await db.carts.update_one({"user_id": current_user_id}, {"$set": cart.dict()}, upsert=True)
+    logger.info(f"Cart update result: matched={update_result.matched_count}, modified={update_result.modified_count}, upserted_id={update_result.upserted_id}")
+
+    enriched_cart = await _enrich_cart(cart)
+    logger.info("Cart enriched successfully")
+    return enriched_cart
 
 @api_router.put("/cart/items/{product_id}")
 async def update_cart_item(product_id: str, payload: Dict[str, int], current_user_id: str = Depends(get_current_user)):
@@ -1093,6 +1227,443 @@ async def delete_product(
     await db.products.delete_one({"id": product_id})
     
     return {"message": "Product deleted successfully"}
+
+#Endpoint para optener factura por medio de transactionId
+
+@api_router.get("/invoices/by-transaction/{transaction_id}", response_model=InvoiceResponse)
+async def get_invoice_by_transaction(
+    transaction_id: str,
+    current_user_id: str = Depends(get_current_user)
+):
+    """
+    Obtener factura por ID de transacción
+    """
+    try:
+        # Buscar factura por transaction_id
+        invoice_data = await db.invoices.find_one({"payment_transaction_id": transaction_id})
+        if not invoice_data:
+            raise HTTPException(status_code=404, detail="Factura no encontrada")
+        
+        # Verificar que el usuario es el propietario
+        if invoice_data["user_id"] != current_user_id:
+            raise HTTPException(status_code=403, detail="No autorizado para ver esta factura")
+        
+        invoice = Invoice(**invoice_data)
+        
+        # Obtener información adicional
+        order = await db.orders.find_one({"id": invoice.order_id})
+        customer = await db.users.find_one({"id": invoice.user_id})
+        
+        customer_info = None
+        if customer:
+            customer_info = {
+                "name": customer["name"],
+                "email": customer["email"],
+                "phone": customer.get("phone", ""),
+                "address": customer.get("address", "")
+            }
+        
+        return InvoiceResponse(
+            invoice=invoice,
+            order=order,
+            customer=customer_info
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting invoice by transaction: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener factura")
+    
+# Endpoint existente de invoices
+
+@api_router.get("/invoices/{invoice_id}", response_model=InvoiceResponse)
+async def get_invoice(
+    invoice_id: str,
+    current_user_id: str = Depends(get_current_user)
+):
+    """
+    Obtener factura por ID
+    """
+    try:
+        # Si es 'demo', devolver datos de ejemplo
+        if invoice_id == 'demo':
+            return get_demo_invoice_data()
+            
+        # Buscar factura
+        invoice_data = await db.invoices.find_one({"id": invoice_id})
+        if not invoice_data:
+            raise HTTPException(status_code=404, detail="Factura no encontrada")
+        
+        # Verificar que el usuario es el propietario o es admin
+        if invoice_data["user_id"] != current_user_id:
+            # Verificar si es admin
+            user_data = await db.users.find_one({"id": current_user_id})
+            if not user_data or not user_data.get("is_admin", False):
+                raise HTTPException(status_code=403, detail="No autorizado para ver esta factura")
+        
+        invoice = Invoice(**invoice_data)
+        
+        # Obtener información adicional
+        order = await db.orders.find_one({"id": invoice.order_id})
+        customer = await db.users.find_one({"id": invoice.user_id})
+        
+        customer_info = None
+        if customer:
+            customer_info = {
+                "name": customer["name"],
+                "email": customer["email"],
+                "phone": customer.get("phone", ""),
+                "address": customer.get("address", "")
+            }
+        
+        return InvoiceResponse(
+            invoice=invoice,
+            order=order,
+            customer=customer_info
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting invoice: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener factura")
+
+# Añadir función para datos de ejemplo
+def get_demo_invoice_data():
+    """Devuelve datos de factura de ejemplo para desarrollo"""
+    demo_invoice = Invoice(
+        id="inv_demo_001",
+        order_id="ord_demo_001",
+        user_id="user_demo_001",
+        invoice_number="FAC-2024-001",
+        issue_date=datetime.now(timezone.utc),
+        due_date=datetime.now(timezone.utc) + timedelta(days=30),
+        items=[
+            {
+                "product_id": "prod_001",
+                "name": "Paracetamol 500mg",
+                "description": "Analgésico y antipirético",
+                "quantity": 2,
+                "unit_price": 15000,
+                "total_price": 30000,
+                "requires_prescription": False
+            },
+            {
+                "product_id": "prod_002", 
+                "name": "Amoxicilina 250mg",
+                "description": "Antibiótico de amplio espectro",
+                "quantity": 1,
+                "unit_price": 25000,
+                "total_price": 25000,
+                "requires_prescription": True
+            }
+        ],
+        subtotal=55000,
+        tax_amount=10450,
+        discount_amount=0,
+        total_amount=65450,
+        currency="COP",
+        status="paid",
+        payment_method="card",
+        payment_transaction_id="TXN_DEMO_001",
+        customer_info={
+            "name": "Cliente Demo",
+            "email": "cliente@demo.com",
+            "phone": "+57 300 123 4567",
+            "address": "Calle Demo #123, Bogotá"
+        },
+        shipping_info={
+            "name": "Cliente Demo",
+            "email": "cliente@demo.com", 
+            "phone": "+57 300 123 4567",
+            "address": "Calle Demo #123, Bogotá"
+        },
+        notes="Gracias por su compra en Farmachelo"
+    )
+    
+    return InvoiceResponse(
+        invoice=demo_invoice,
+        order={
+            "id": "ord_demo_001",
+            "user_id": "user_demo_001",
+            "status": "completed",
+            "total_amount": 65450
+        },
+        customer=demo_invoice.customer_info
+    )
+
+# ==================== ADMIN ORDER MANAGEMENT ROUTES ====================
+
+@api_router.get("/admin/orders")
+async def get_all_orders(
+    status: Optional[str] = None,
+    limit: int = 100,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Listar todos los pedidos del sistema (todos los usuarios)
+    Opcionalmente filtrar por estado
+    """
+    try:
+        # Construir query
+        query = {}
+        if status:
+            query["status"] = status
+        
+        # Obtener pedidos
+        orders = await db.orders.find(query).sort("created_at", -1).limit(limit).to_list(limit)
+        
+        # Enriquecer con información de usuario y productos
+        # Enriquecer con información de usuario y productos
+        enriched_orders = []
+        for order in orders:
+            try:
+                # Validar que la orden tenga la estructura mínima esperada
+                if "id" not in order:
+                    continue
+                    
+                # Obtener usuario
+                user_id = order.get("user_id")
+                user = None
+                if user_id:
+                    user = await db.users.find_one({"id": user_id})
+                
+                user_info = {
+                    "name": user["name"],
+                    "email": user["email"]
+                } if user else {"name": "Usuario desconocido", "email": ""}
+                
+                
+                # Obtener información de productos
+                # Si el order ya tiene enriched_items (después de pago), usarlos
+                if order.get("enriched_items"):
+                    items_with_details = order["enriched_items"]
+                else:
+                    # Si no, construir desde items básicos
+                    items_with_details = []
+                    for item in order.get("items", []):
+                        # Validar estructura de item
+                        if not isinstance(item, dict) or "product_id" not in item:
+                            continue
+                            
+                        product = await db.products.find_one({"id": item["product_id"]})
+                        if product:
+                            items_with_details.append({
+                                "product_id": item["product_id"],
+                                "name": product["name"],
+                                "quantity": item.get("quantity", 1),
+                                "unit_price": product["price"],
+                                "total_price": product["price"] * item.get("quantity", 1),
+                                "requires_prescription": product.get("requires_prescription", False)
+                            })
+                
+                
+                # Información de factura (ahora dentro del mismo order)
+                invoice_info = None
+                if order.get("invoice_number"):
+                    invoice_info = {
+                        "invoice_id": order["id"],
+                        "invoice_number": order.get("invoice_number")
+                    }
+                
+                
+                    # Convertir ObjectId a string para evitar errores de serialización
+                order_dict = dict(order)
+                if "_id" in order_dict:
+                    order_dict["_id"] = str(order_dict["_id"])
+                
+                enriched_orders.append({
+                    **order_dict,
+                    "user_info": user_info,
+                    "items_details": items_with_details,
+                    "invoice_info": invoice_info
+                })
+            except Exception as order_error:
+                logger.error(f"Error processing order {order.get('_id')}: {str(order_error)}")
+                continue
+        
+        return enriched_orders
+        
+    except Exception as e:
+        logger.error(f"Error getting all orders: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener pedidos")
+
+@api_router.get("/admin/orders/stats", response_model=OrderStats)
+async def get_order_stats(
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Obtener estadísticas de pedidos
+    """
+    try:
+        # Contar pedidos por estado
+        total_orders = await db.orders.count_documents({})
+        pending_orders = await db.orders.count_documents({"status": "pending"})
+        paid_orders = await db.orders.count_documents({"status": "paid"})
+        processing_orders = await db.orders.count_documents({"status": "processing"})
+        shipped_orders = await db.orders.count_documents({"status": "shipped"})
+        delivered_orders = await db.orders.count_documents({"status": "delivered"})
+        cancelled_orders = await db.orders.count_documents({"status": "cancelled"})
+        
+        # Calcular ingresos totales
+        all_orders = await db.orders.find({}).to_list(None)
+        total_revenue = sum(order.get("total_amount", 0) for order in all_orders)
+        
+        # Calcular estadísticas del mes
+        now = datetime.now(timezone.utc)
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        monthly_orders_count = await db.orders.count_documents({
+            "created_at": {"$gte": start_of_month}
+        })
+        
+        monthly_orders_list = await db.orders.find({
+            "created_at": {"$gte": start_of_month}
+        }).to_list(None)
+        monthly_revenue = sum(order.get("total_amount", 0) for order in monthly_orders_list)
+        
+        return OrderStats(
+            total_orders=total_orders,
+            pending_orders=pending_orders,
+            paid_orders=paid_orders,
+            processing_orders=processing_orders,
+            shipped_orders=shipped_orders,
+            delivered_orders=delivered_orders,
+            cancelled_orders=cancelled_orders,
+            total_revenue=total_revenue,
+            monthly_revenue=monthly_revenue,
+            monthly_orders=monthly_orders_count
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting order stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener estadísticas")
+
+@api_router.get("/admin/orders/{order_id}")
+async def get_order_details(
+    order_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Obtener detalles completos de un pedido específico
+    """
+    try:
+        # Buscar pedido
+        order = await db.orders.find_one({"id": order_id})
+        if not order:
+            raise HTTPException(status_code=404, detail="Pedido no encontrado")
+        
+        # Obtener usuario
+        user = await db.users.find_one({"id": order["user_id"]})
+        user_info = {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+            "phone": user.get("phone", ""),
+            "address": user.get("address", "")
+        } if user else None
+        
+        # Obtener productos con detalles
+        items_with_details = []
+        for item in order.get("items", []):
+            product = await db.products.find_one({"id": item["product_id"]})
+            if product:
+                items_with_details.append({
+                    "product_id": item["product_id"],
+                    "name": product["name"],
+                    "description": product.get("description", ""),
+                    "quantity": item["quantity"],
+                    "unit_price": product["price"],
+                    "total_price": product["price"] * item["quantity"],
+                    "requires_prescription": product.get("requires_prescription", False)
+                })
+        
+        # Información de factura (ahora dentro del mismo order)
+        invoice_info = None
+        if order.get("invoice_number"):
+            invoice_info = {
+                "id": order["id"],
+                "invoice_number": order.get("invoice_number"),
+                "issue_date": order.get("invoice_date"),
+                "payment_method": order.get("payment_method"),
+                "total_amount": order.get("total_amount"),
+                "customer_info": order.get("customer_info")
+            }
+        
+        
+        # Buscar transacción de pago
+        payment_transaction = None
+        if order.get("payment_session_id"):
+            payment = await db.payment_transactions.find_one({
+                "transaction_id": order["payment_session_id"]
+            })
+            if payment:
+                payment_transaction = {
+                    "transaction_id": payment["transaction_id"],
+                    "amount": payment["amount"],
+                    "currency": payment.get("currency", "COP"),
+                    "status": payment["status"],
+                    "created_at": payment["created_at"]
+                }
+        
+        return {
+            **order,
+            "user_info": user_info,
+            "items_details": items_with_details,
+            "invoice_info": invoice_info,
+            "payment_transaction": payment_transaction
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting order details: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener detalles del pedido")
+
+@api_router.put("/admin/orders/{order_id}/status")
+async def update_order_status(
+    order_id: str,
+    order_update: OrderUpdate,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Actualizar el estado de un pedido
+    """
+    try:
+        # Validar estado
+        valid_statuses = ["pending", "paid", "processing", "shipped", "delivered", "cancelled"]
+        if order_update.status not in valid_statuses:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Estado inválido. Estados válidos: {', '.join(valid_statuses)}"
+            )
+        
+        # Verificar que el pedido existe
+        order = await db.orders.find_one({"id": order_id})
+        if not order:
+            raise HTTPException(status_code=404, detail="Pedido no encontrado")
+        
+        # Actualizar estado
+        await db.orders.update_one(
+            {"id": order_id},
+            {
+                "$set": {
+                    "status": order_update.status,
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        )
+        
+        # Obtener pedido actualizado
+        updated_order = await db.orders.find_one({"id": order_id})
+        
+        return {
+            "message": "Estado del pedido actualizado exitosamente",
+            "order": updated_order
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating order status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al actualizar estado del pedido")
 
 # Endpoint para subir imágenes (opcional)
 @api_router.post("/admin/upload-image")

@@ -10,18 +10,59 @@ const CartModal = ({ isOpen, onClose, cart, onUpdateCart, token }) => {
       return;
     }
 
-    try {
-      const response = await axios.put(`${API}/cart/items/${productId}`, 
-        { quantity: newQuantity },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      onUpdateCart(response.data);
-    } catch (error) {
-      console.error('Error updating quantity:', error);
+    if (!token) {
+      try {
+        const raw = localStorage.getItem('cart');
+        const local = raw ? JSON.parse(raw) : { items: [] };
+        const itemIndex = local.items.findIndex(it => (it.product_id || it.id) === productId);
+        if (itemIndex > -1) {
+          local.items[itemIndex].quantity = newQuantity;
+        }
+        local.total = local.items.reduce((s, it) => s + (Number(it.price || 0) * (it.quantity || 0)), 0);
+        local.updated_at = new Date().toISOString();
+        localStorage.setItem('cart', JSON.stringify(local));
+        onUpdateCart({ id: null, user_id: null, items: local.items, updated_at: local.updated_at });
+      } catch (e) {
+        console.error('Error updating quantity in local cart:', e);
+      }
+      return;
     }
+
+    // If authenticated, proceed with API call
+      if (!token) {
+        console.error('No hay token de autenticación');
+        return;
+      }
+
+
+      try {
+        const response = await axios.delete(`${API}/cart/items/${productId}`, 
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        onUpdateCart(response.data);
+      } catch (error) {
+        console.error('Error removing item:', error);
+      }
+
   };
 
   const removeItem = async (productId) => {
+    if (!token) {
+      try {
+        const raw = localStorage.getItem('cart');
+        const local = raw ? JSON.parse(raw) : { items: [] };
+        const newItems = local.items.filter(it => (it.product_id || it.id) !== productId);
+        local.items = newItems;
+        local.total = local.items.reduce((s, it) => s + (Number(it.price || 0) * (it.quantity || 0)), 0);
+        local.updated_at = new Date().toISOString();
+        localStorage.setItem('cart', JSON.stringify(local));
+        onUpdateCart({ id: null, user_id: null, items: local.items, updated_at: local.updated_at });
+      } catch (e) {
+        console.error('Error removing item from local cart:', e);
+      }
+      return;
+    }
+
     try {
       const response = await axios.delete(`${API}/cart/items/${productId}`, 
         { headers: { Authorization: `Bearer ${token}` } }
@@ -148,5 +189,7 @@ const CartModal = ({ isOpen, onClose, cart, onUpdateCart, token }) => {
     </div>
   );
 };
+
+console.log('CartModal cart:', cart);
 
 export default CartModal;

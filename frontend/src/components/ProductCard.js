@@ -2,10 +2,7 @@ import React from 'react';
 
 const ProductCard = ({ product, onAddToCart, user }) => {
   const handleAddToCart = () => {
-    if (!user) {
-      alert('Debes iniciar sesión para agregar productos al carrito');
-      return;
-    }
+    // Delegar la lógica al padre: App.js ahora maneja carrito local y autenticado
     onAddToCart(product);
   };
 
@@ -41,6 +38,7 @@ const ProductCard = ({ product, onAddToCart, user }) => {
           className="add-to-cart-btn"
           onClick={handleAddToCart}
           disabled={product.stock === 0}
+          title={!user ? "Inicia sesión para agregar al carrito" : (product.stock === 0 ? "Producto sin stock" : "Agregar al carrito")}
         >
           {product.stock === 0 ? 'Sin stock' : 'Agregar al carrito'}
         </button>

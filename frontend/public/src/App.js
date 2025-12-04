@@ -139,18 +139,16 @@ const App = () => {
 
   // El acceso de admin se basa en user.is_admin y el JWT normal
 
-  useEffect(() => {
-    const savedToken = localStorage.getItem('token');
-    const savedUser = localStorage.getItem('user');
-    if (savedToken && savedUser) {
-      setToken(savedToken);
-      const parsedUser = JSON.parse(savedUser);
-      setUser(parsedUser);
-      // No mostrar admin automáticamente, solo si el usuario lo solicita
-    }
-    setLoading(false);
-  }, []);
-
+useEffect(() => {
+  const savedToken = localStorage.getItem('token');
+  const savedUser = localStorage.getItem('user');
+  if (savedToken && savedUser) {
+    setToken(savedToken);
+    const parsedUser = JSON.parse(savedUser);
+    setUser(parsedUser);
+  }
+  setLoading(false);
+}, []);
   useEffect(() => {
     const loadProducts = async () => {
       try {
@@ -171,25 +169,24 @@ const App = () => {
   }, [user, token]);
 
   // Sincronizar carrito con localStorage para payment.html (siempre, aunque no haya usuario logueado)
- useEffect(() => {
-  if (cart && cart.items && cart.items.length > 0) {
-    // Guardar información completa del carrito
-    const cartData = {
-      items: cart.items.map(item => ({
-        product_id: item.product_id || item.id,
-        id: item.product_id || item.id,
-        name: item.name,
-        price: item.price,
-        quantity: item.quantity,
-        image_url: item.image_url
-      })),
-      total: cart.items.reduce((total, item) => total + (item.price * item.quantity), 0)
-    };
-    localStorage.setItem('cart', JSON.stringify(cartData));
-  } else {
-    localStorage.removeItem('cart');
-  }
-}, [cart]);
+  useEffect(() => {
+    if (cart && cart.items) {
+      const cartData = {
+        items: cart.items.map(item => ({
+          id: item.product_id || item.id,
+          name: item.name,
+          price: Number(item.price) || 0,
+          quantity: Number(item.quantity) || 1
+        })),
+        total: cart.items.reduce((sum, item) => 
+          sum + (Number(item.price || 0) * (item.quantity || 1)), 0
+        )
+      };
+      localStorage.setItem('cart', JSON.stringify(cartData));
+    } else {
+      localStorage.removeItem('cart');
+    }
+  }, [cart]);
 
   const addToast = (message, type = 'info') => {
     const id = Date.now();
@@ -234,55 +231,56 @@ const App = () => {
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    setUser(null);
-    setToken(null);
-    setCart(null);
-    setShowAdmin(false);
-    addToast('Sesión cerrada correctamente', 'info');
-  };
-
+    const handleLogout = () => {
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+      localStorage.removeItem('cart'); // Limpiar carrito también
+      setUser(null);
+      setToken(null);
+      setCart(null);
+      setShowAdmin(false);
+      addToast('Sesión cerrada correctamente', 'info');
+    };
   const handleShowAuth = (mode) => {
     setAuthMode(mode);
     setShowAuth(true);
   };
 
-  const handleAddToCart = async (product) => {
-    if (!user || !token) {
-      addToast('Debes iniciar sesión para agregar productos al carrito', 'warning');
-      return;
-    }
+const handleAddToCart = async (product) => {
+  // VERIFICAR SI EL USUARIO ESTÁ AUTENTICADO
+  if (!user || !token) {
+    addToast('Por favor inicia sesión para agregar productos al carrito', 'warning');
+    setShowAuth(true); // Abrir modal de autenticación
+    return;
+  }
 
-    try {
-      const response = await axios.post(`${API}/cart/items`, {
-        product_id: product.id,
-        quantity: 1
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      // Asegurar que los items del carrito tengan la estructura correcta
-      const updatedCart = {
-        ...response.data,
-        items: response.data.items.map(item => ({
-          ...item,
-          name: item.name || product.name,
-          price: item.price || product.price,
-          image_url: item.image_url || product.image_url,
-          requires_prescription: item.requires_prescription || product.requires_prescription
-        }))
-      };
-      
-      setCart(updatedCart);
-      addToast(`${product.name} agregado al carrito`, 'success');
-    } catch (error) {
-      console.error('Error adding to cart:', error);
-      addToast('Error al agregar producto al carrito', 'error');
-    }
-  };
+  // SOLO usuarios autenticados pueden agregar al carrito
+  try {
+    const response = await axios.post(`${API}/cart/items`, {
+      product_id: product.id,
+      quantity: 1
+    }, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
 
+    const updatedCart = {
+      ...response.data,
+      items: response.data.items.map(item => ({
+        ...item,
+        name: item.name || product.name,
+        price: item.price || product.price,
+        image_url: item.image_url || product.image_url,
+        requires_prescription: item.requires_prescription || product.requires_prescription
+      }))
+    };
+
+    setCart(updatedCart);
+    addToast(`${product.name} agregado al carrito`, 'success'); // Mensaje limpio
+  } catch (error) {
+    console.error('Error adding to cart:', error);
+    addToast('Error al agregar producto al carrito', 'error');
+  }
+};
   const cartItemsCount = cart ? cart.items.reduce((total, item) => total + item.quantity, 0) : 0;
 
   if (loading) {
@@ -406,4 +404,5 @@ const App = () => {
   );
 };
 
+console.log('Cart sync:', cart);
 export default App;

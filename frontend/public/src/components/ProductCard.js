@@ -10,10 +10,7 @@ const ProductCard = ({ product, onAddToCart, user }) => {
   };
 
   const handleAddToCart = () => {
-    if (!user) {
-      alert('Debes iniciar sesión para agregar productos al carrito');
-      return;
-    }
+    // Delegar la lógica al padre (App.js) que ahora maneja carrito local y autenticado
     onAddToCart(product);
   };
 
@@ -45,13 +42,15 @@ const ProductCard = ({ product, onAddToCart, user }) => {
       
       <div className="product-footer">
         <div className="product-price">${formatPrice(product.price)}</div>
-        <button 
-          className="add-to-cart-btn"
-          onClick={handleAddToCart}
-          disabled={product.stock === 0}
-        >
-          {product.stock === 0 ? 'Sin stock' : 'Agregar al carrito'}
-        </button>
+          <button 
+            className="add-to-cart-btn"
+            onClick={handleAddToCart}
+            disabled={product.stock === 0 || !user} // Deshabilitar si no hay usuario
+            title={!user ? "Inicia sesión para agregar al carrito" : ""}
+          >
+            {!user ? "Inicia sesión para comprar" : 
+            product.stock === 0 ? 'Sin stock' : 'Agregar al carrito'}
+          </button>
       </div>
     </div>
   );
